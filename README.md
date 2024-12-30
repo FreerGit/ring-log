@@ -2,7 +2,7 @@
 [![Crates.io](https://img.shields.io/crates/v/ring-log?style=flat-square)](https://crates.io/crates/ring-log/versions)
 [![license](https://img.shields.io/github/license/freergit/ring-log)](https://github.com/freergit/ring-log/blob/main/LICENSE.txt)
 
-# fast-log
+# ring-log
 High-performance logger with lock-free ring buffer, use this library when you want to log in the hotpath and performance is critical.
 
 ## Example
