@@ -15,14 +15,34 @@ let o = LoggerFileOptions {
 };
 
 // The size is bounded, issuing a new log when the ringbuffer is full will block.
-let logger = Logger::new(1024 * 8, Some(o));
+// When passing a LoggerFileOptions, .with_log_type(LogTo::File) is set implicitly.
+let logger = Logger::builder(1024 * 8, Some(o)).with_time(true);
 
-// Log to stdout
-logger.log(|| format!("To stdout: {}", 42));
+// Log to file
+logger.info(String::new);
+logger.info(|| String::from("hello"));
+logger.debug(|| "foo");
 
-// Log to the file, format_log! will prepend the file and LOC location to the log.
-logger.log_f(|| format_log!("To log.txt {}", 5)); // path/to/file:LINE: To log.txt 5
+// Log to stdout, without date/time
+let logger = logger.with_log_type(LogTo::Ephemeral).with_time(false);
 
-// Blocks until all logs are handled.
+// Will now log to stdout
+logger.info(String::new);
+logger.info(|| String::from("hello"));
+logger.debug(|| "foo");
+
+// Set it back to file 
+let logger = logger.with_log_type(LogTo::File);
+
+// Blocks until all logs are handled. Natural race condition if this is not called.
 logger.shutdown();
 ```
+
+        let logger = Logger::builder(1024, None).with_time(true);
+        logger.info(String::new);
+        logger.info(|| String::from("hello"));
+        logger.debug(|| "foo");
+        let logger = logger.with_time(false);
+        logger.error(|| "bar");
+        logger.warning(|| "world");
+        logger.shutdown();
