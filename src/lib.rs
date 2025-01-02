@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::thread::{self};
 
 #[derive(Clone)]
-enum LogType {
+pub enum LogTo {
     Ephemeral,
     File,
 }
 
 struct LogEntry {
     closure: Box<dyn FnOnce() -> String + Send>,
-    to: LogType,
+    log_to: LogTo,
 }
 
 struct RingBuffer {
@@ -71,7 +71,7 @@ impl RingBuffer {
                             entry,
                             LogEntry {
                                 closure: Box::new(|| "Error: LogEntry moved".to_string()),
-                                to: entry.to.clone(),
+                                log_to: entry.log_to.clone(),
                             },
                         ));
                     }
@@ -118,6 +118,8 @@ impl RingBuffer {
 pub struct Logger {
     buffer: Arc<RingBuffer>,
     file: Option<File>,
+    log_to: LogTo,
+    with_time: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -127,10 +129,9 @@ pub struct LoggerFileOptions {
 }
 
 impl Logger {
-    pub fn new(size: usize, log_op: Option<LoggerFileOptions>) -> Self {
+    pub fn builder(size: usize, log_op: Option<LoggerFileOptions>) -> Self {
         let buffer = Arc::new(RingBuffer::new(size));
         let buffer_clone = buffer.clone();
-
         thread::spawn(move || {
             let mut file = None;
             if let Some(op) = log_op {
@@ -140,14 +141,14 @@ impl Logger {
                 if let Some(entry) = buffer_clone.pop() {
                     let mut message = (entry.closure)();
 
-                    match entry.to {
-                        LogType::File => {
+                    match entry.log_to {
+                        LogTo::File => {
                             message.push('\n');
                             let f = file.as_mut().unwrap();
                             f.write_all(message.as_bytes()).unwrap();
                             f.flush().unwrap();
                         }
-                        LogType::Ephemeral => println!("{}", message),
+                        LogTo::Ephemeral => println!("{}", message),
                     };
                 } else if buffer_clone.should_shutdown() && buffer_clone.is_empty() {
                     break;
@@ -159,7 +160,12 @@ impl Logger {
 
         let file = log_op.map(Logger::open_log_file);
 
-        Logger { buffer, file }
+        Logger {
+            buffer,
+            file,
+            log_to: log_op.map_or(LogTo::Ephemeral, |_| LogTo::File),
+            with_time: false,
+        }
     }
 
     fn open_log_file(op: LoggerFileOptions) -> File {
@@ -171,6 +177,46 @@ impl Logger {
             .unwrap()
     }
 
+    #[track_caller]
+    fn log<F, T>(&self, level: &'static str, f: F)
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: AsRef<str>,
+    {
+        let location = std::panic::Location::caller();
+        let file_line = format!("{}:{}", location.file(), location.line());
+        let tt = self.with_time.clone();
+        let mut entry = LogEntry {
+            closure: Box::new(move || {
+                let time = match tt {
+                    true => format!(
+                        "{}",
+                        chrono::offset::Local::now().format("%Y-%m-%d %H:%M:%S ")
+                    ),
+                    false => String::new(),
+                };
+                let message = f();
+                format!("{}{} {} {}", time, file_line, level, message.as_ref())
+            }),
+            log_to: self.log_to.clone(),
+        };
+
+        while !self.buffer.push(&mut entry) {
+            thread::yield_now(); // Wait if the buffer is full
+        }
+    }
+
+    pub fn with_log_type(mut self, t: LogTo) -> Self {
+        self.log_to = t;
+        self
+    }
+
+    pub fn with_time(mut self, time: bool) -> Self {
+        self.with_time = time;
+        self
+    }
+
+    /// Waits until all messages are logged
     pub fn shutdown(&self) {
         self.buffer.shutdown();
         while !self.buffer.is_empty() {
@@ -182,38 +228,41 @@ impl Logger {
         }
     }
 
-    pub fn log<F>(&self, f: F)
+    #[track_caller]
+    pub fn info<F, T>(&self, f: F)
     where
-        F: FnMut() -> String + Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        T: AsRef<str>,
     {
-        let mut entry = LogEntry {
-            closure: Box::new(f),
-            to: LogType::Ephemeral,
-        };
-        while !self.buffer.push(&mut entry) {
-            thread::yield_now();
-        }
+        self.log("\x1b[32m[INFO]\x1b[0m", f);
     }
 
-    pub fn log_f<F>(&self, f: F)
+    #[track_caller]
+    pub fn error<F, T>(&self, f: F)
     where
-        F: FnMut() -> String + Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+        T: AsRef<str>,
     {
-        let mut entry = LogEntry {
-            closure: Box::new(f),
-            to: LogType::File,
-        };
-        while !self.buffer.push(&mut entry) {
-            thread::yield_now();
-        }
+        self.log("\x1b[31m[ERROR]\x1b[0m", f);
     }
-}
 
-#[macro_export]
-macro_rules! format_log {
-    ($($arg:tt)*) => {
-        format!("{}:{}: {}", file!(), line!(), format!($($arg)*))
-    };
+    #[track_caller]
+    pub fn debug<F, T>(&self, f: F)
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: AsRef<str>,
+    {
+        self.log("\x1b[36m[DEBUG]\x1b[0m", f);
+    }
+
+    #[track_caller]
+    pub fn warning<F, T>(&self, f: F)
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: AsRef<str>,
+    {
+        self.log("\x1b[33m[WARNING]\x1b[0m", f);
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +288,20 @@ mod tests {
     fn run_test_sequentially() {
         simple_to_file();
         correct_ord();
+        tt();
+    }
+
+    fn tt() {
+        setup();
+        let logger = Logger::builder(1024, None).with_time(true);
+        logger.info(|| String::new());
+        logger.info(|| String::from("hello"));
+        logger.debug(|| "foo");
+        let logger = logger.with_time(false);
+        logger.error(|| "bar");
+        logger.warning(|| "world");
+        logger.shutdown();
+        teardown();
     }
 
     fn simple_to_file() {
@@ -247,12 +310,15 @@ mod tests {
             path: "log.txt",
             append_mode: false,
         };
-        let logger = Logger::new(1024, Some(o));
-        logger.log_f(|| "to file".to_owned());
+        let logger = Logger::builder(1024, Some(o)).with_time(false);
+        logger.info(|| "to file".to_owned());
         logger.shutdown();
         let bytes = fs::read(o.path).unwrap();
         teardown();
-        assert_eq!(String::from_utf8(bytes).unwrap(), "to file\n".to_owned());
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            "src/lib.rs:314 \u{1b}[32m[INFO]\u{1b}[0m to file\n".to_owned()
+        );
     }
 
     fn correct_ord() {
@@ -261,15 +327,18 @@ mod tests {
             path: "log.txt",
             append_mode: false,
         };
-        let logger = Logger::new(1024 * 1024, Some(o));
+        let logger = Logger::builder(1024 * 1024, Some(o));
         for i in 0..100_000 {
-            logger.log_f(move || format!("{}", i));
+            logger.debug(move || format!("{}", i));
         }
 
         logger.shutdown();
 
         for (i, line) in fs::read_to_string("log.txt").unwrap().lines().enumerate() {
-            assert_eq!(line, format!("{}", i));
+            assert_eq!(
+                line,
+                format!("src/lib.rs:332 \u{1b}[36m[DEBUG]\u{1b}[0m {}", i)
+            );
         }
         teardown();
     }
