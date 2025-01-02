@@ -37,12 +37,3 @@ let logger = logger.with_log_type(LogTo::File);
 // Blocks until all logs are handled. Natural race condition if this is not called.
 logger.shutdown();
 ```
-
-        let logger = Logger::builder(1024, None).with_time(true);
-        logger.info(String::new);
-        logger.info(|| String::from("hello"));
-        logger.debug(|| "foo");
-        let logger = logger.with_time(false);
-        logger.error(|| "bar");
-        logger.warning(|| "world");
-        logger.shutdown();
