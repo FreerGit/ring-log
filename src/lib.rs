@@ -185,7 +185,7 @@ impl Logger {
     {
         let location = std::panic::Location::caller();
         let file_line = format!("{}:{}", location.file(), location.line());
-        let tt = self.with_time.clone();
+        let tt = self.with_time;
         let mut entry = LogEntry {
             closure: Box::new(move || {
                 let time = match tt {
@@ -294,7 +294,7 @@ mod tests {
     fn tt() {
         setup();
         let logger = Logger::builder(1024, None).with_time(true);
-        logger.info(|| String::new());
+        logger.info(String::new);
         logger.info(|| String::from("hello"));
         logger.debug(|| "foo");
         let logger = logger.with_time(false);
