@@ -1,9 +1,10 @@
-use std::cell::UnsafeCell;
 use std::fs::File;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self};
+
+use crossbeam::queue::ArrayQueue;
 
 #[derive(Clone)]
 pub enum LogTo {
@@ -16,110 +17,12 @@ struct LogEntry {
     log_to: LogTo,
 }
 
-struct RingBuffer {
-    buffer: Vec<AtomicUsize>,
-    entries: Vec<UnsafeCell<Option<LogEntry>>>,
-    head: AtomicUsize,
-    tail: AtomicUsize,
-    size: usize,
-    is_empty: AtomicBool,
-    shutdown: AtomicBool,
-}
-
-unsafe impl Sync for RingBuffer {}
-
-impl RingBuffer {
-    fn new(size: usize) -> Self {
-        RingBuffer {
-            size,
-            buffer: (0..size).map(|_| AtomicUsize::new(0)).collect(),
-            entries: (0..size).map(|_| UnsafeCell::new(None)).collect(),
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-            is_empty: AtomicBool::new(true),
-            shutdown: AtomicBool::new(false),
-        }
-    }
-
-    fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Release);
-    }
-
-    fn should_shutdown(&self) -> bool {
-        self.shutdown.load(Ordering::Acquire)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.is_empty.load(Ordering::Acquire)
-    }
-
-    fn push(&self, entry: &mut LogEntry) -> bool {
-        let mut head = self.head.load(Ordering::Relaxed);
-        loop {
-            let next = (head + 1) % self.size;
-            if next == self.tail.load(Ordering::Relaxed) {
-                return false; // Buffer is full
-            }
-            match self
-                .head
-                .compare_exchange(head, next, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    unsafe {
-                        // TODO
-                        *self.entries[head].get() = Some(std::mem::replace(
-                            entry,
-                            LogEntry {
-                                closure: Box::new(|| "Error: LogEntry moved".to_string()),
-                                log_to: entry.log_to.clone(),
-                            },
-                        ));
-                    }
-                    self.buffer[head].store(1, Ordering::Release);
-                    self.is_empty.store(false, Ordering::Release);
-                    return true;
-                }
-                Err(x) => head = x,
-            }
-        }
-    }
-
-    fn pop(&self) -> Option<LogEntry> {
-        let mut tail = self.tail.load(Ordering::Relaxed);
-        loop {
-            if self.buffer[tail].load(Ordering::Acquire) == 0 {
-                return None; // Buffer is empty
-            }
-            let next = (tail + 1) % self.size;
-            match self
-                .tail
-                .compare_exchange_weak(tail, next, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    let entry = unsafe { (*self.entries[tail].get()).take() };
-                    self.buffer[tail].store(0, Ordering::Release);
-                    if next == self.head.load(Ordering::Relaxed) {
-                        self.is_empty.store(true, Ordering::Release);
-                    }
-                    return entry;
-                }
-                Err(x) => tail = x,
-            }
-        }
-    }
-
-    fn wait_for_new_entries(&self) {
-        while self.is_empty() && !self.should_shutdown() {
-            thread::yield_now();
-        }
-    }
-}
-
 pub struct Logger {
-    buffer: Arc<RingBuffer>,
+    queue: Arc<ArrayQueue<LogEntry>>,
     file: Option<File>,
     log_to: LogTo,
     with_time: bool,
+    shutdown: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy)]
@@ -130,15 +33,18 @@ pub struct LoggerFileOptions {
 
 impl Logger {
     pub fn builder(size: usize, log_op: Option<LoggerFileOptions>) -> Self {
-        let buffer = Arc::new(RingBuffer::new(size));
-        let buffer_clone = buffer.clone();
+        let queue = Arc::new(ArrayQueue::<LogEntry>::new(size));
+        let queue_clone = queue.clone();
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_flag_clone = shutdown_flag.clone();
         thread::spawn(move || {
             let mut file = None;
             if let Some(op) = log_op {
                 file = Some(Logger::open_log_file(op));
             }
+
             loop {
-                if let Some(entry) = buffer_clone.pop() {
+                if let Some(entry) = queue_clone.pop() {
                     let mut message = (entry.closure)();
 
                     match entry.log_to {
@@ -150,10 +56,10 @@ impl Logger {
                         }
                         LogTo::Ephemeral => println!("{}", message),
                     };
-                } else if buffer_clone.should_shutdown() && buffer_clone.is_empty() {
+                } else if queue_clone.is_empty() && shutdown_flag_clone.load(Ordering::Acquire) {
                     break;
                 } else {
-                    buffer_clone.wait_for_new_entries();
+                    thread::yield_now();
                 }
             }
         });
@@ -161,10 +67,11 @@ impl Logger {
         let file = log_op.map(Logger::open_log_file);
 
         Logger {
-            buffer,
+            queue,
             file,
             log_to: log_op.map_or(LogTo::Ephemeral, |_| LogTo::File),
             with_time: false,
+            shutdown: shutdown_flag,
         }
     }
 
@@ -183,11 +90,11 @@ impl Logger {
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
     {
-        let location = std::panic::Location::caller();
-        let file_line = format!("{}:{}", location.file(), location.line());
         let tt = self.with_time;
-        let mut entry = LogEntry {
+        let location = std::panic::Location::caller();
+        let entry = LogEntry {
             closure: Box::new(move || {
+                let file_line = format!("{}:{}", location.file(), location.line());
                 let time = match tt {
                     true => format!(
                         "{}",
@@ -201,14 +108,11 @@ impl Logger {
             log_to: self.log_to.clone(),
         };
 
-        while !self.buffer.push(&mut entry) {
-            thread::yield_now(); // Wait if the buffer is full
+        // let value = ;
+        let value = self.queue.push(entry);
+        while value.is_err() {
+            thread::yield_now(); // Wait if the queue is full
         }
-    }
-
-    pub fn with_log_type(mut self, t: LogTo) -> Self {
-        self.log_to = t;
-        self
     }
 
     pub fn with_time(mut self, time: bool) -> Self {
@@ -218,8 +122,8 @@ impl Logger {
 
     /// Waits until all messages are logged
     pub fn shutdown(&self) {
-        self.buffer.shutdown();
-        while !self.buffer.is_empty() {
+        self.shutdown.store(true, Ordering::Release);
+        while !self.queue.is_empty() {
             thread::yield_now();
         }
 
@@ -267,6 +171,8 @@ impl Logger {
 
 #[cfg(test)]
 mod tests {
+    use timing_rdtsc::timing;
+
     use super::*;
     use std::fs;
 
@@ -289,6 +195,7 @@ mod tests {
         simple_to_file();
         correct_ord();
         tt();
+        test_thread_safety();
     }
 
     fn tt() {
@@ -317,7 +224,7 @@ mod tests {
         teardown();
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            "src/lib.rs:314 \u{1b}[32m[INFO]\u{1b}[0m to file\n".to_owned()
+            "src/lib.rs:221 \u{1b}[32m[INFO]\u{1b}[0m to file\n".to_owned()
         );
     }
 
@@ -337,9 +244,76 @@ mod tests {
         for (i, line) in fs::read_to_string("log.txt").unwrap().lines().enumerate() {
             assert_eq!(
                 line,
-                format!("src/lib.rs:332 \u{1b}[36m[DEBUG]\u{1b}[0m {}", i)
+                format!("src/lib.rs:239 \u{1b}[36m[DEBUG]\u{1b}[0m {}", i)
             );
         }
         teardown();
+    }
+
+    fn test_thread_safety() {
+        use std::fs;
+        use std::sync::{Arc, Barrier};
+
+        const NUM_THREADS: usize = 1;
+        const ENTRIES_PER_THREAD: usize = 1000;
+        const EXPECTED_TOTAL_ENTRIES: usize = NUM_THREADS * ENTRIES_PER_THREAD;
+        let log_file_path = "thread_safety_test.log";
+
+        // Configure the logger to write to a file
+        let logger = Arc::new(Logger::builder(
+            1024 * 100,
+            Some(LoggerFileOptions {
+                path: log_file_path,
+                append_mode: false,
+            }),
+        ));
+        let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
+
+        let mut handles = vec![];
+        for thread_id in 0..NUM_THREADS {
+            let logger = logger.clone();
+            let barrier = barrier.clone();
+            let handle = std::thread::spawn(move || {
+                barrier.wait(); // Ensure all threads start logging simultaneously
+                let time = timing(|| {
+                    for i in 0..ENTRIES_PER_THREAD {
+                        logger.info(move || format!("Thread {} - Entry {}", thread_id, i));
+                    }
+                });
+
+                println!("{:#?}", time);
+            });
+            handles.push(handle);
+        }
+
+        barrier.wait(); // Start all threads
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        logger.shutdown();
+
+        // Validate the log file
+        let content = fs::read_to_string(log_file_path).expect("Failed to read log file.");
+        let log_entries: Vec<&str> = content.lines().collect();
+
+        assert_eq!(
+            log_entries.len(),
+            EXPECTED_TOTAL_ENTRIES,
+            "The total number of log entries is incorrect."
+        );
+
+        let mut seen_entries = std::collections::HashSet::new();
+        for line in log_entries {
+            assert!(seen_entries.insert(line.to_string()));
+        }
+        assert_eq!(
+            seen_entries.len(),
+            EXPECTED_TOTAL_ENTRIES,
+            "Duplicate or missing log entries detected."
+        );
+
+        fs::remove_file(log_file_path).expect("Failed to remove log file.");
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "ring-log"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 description = "High-performance logger with lock-free ring buffer"
 license = "MIT"
@@ -10,3 +10,5 @@ keywords = ["log", "logger", "logging", "ring-buffer", "multi-threading"]
 
 [dependencies]
 chrono = "0.4.39"
+crossbeam = "0.8.4"
+timing_rdtsc = "0.1.2"
