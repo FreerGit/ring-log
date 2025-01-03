@@ -1,4 +1,5 @@
 use lockfree::channel::spsc::{create, Sender};
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +18,7 @@ struct LogEntry {
 }
 
 pub struct Logger {
-    sx: Sender<LogEntry>,
+    sx: RefCell<Sender<LogEntry>>,
     file: Option<File>,
     log_to: LogTo,
     with_time: bool,
@@ -69,7 +70,7 @@ impl Logger {
         let file = log_op.map(Logger::open_log_file);
 
         Logger {
-            sx,
+            sx: RefCell::new(sx),
             file,
             log_to: log_op.map_or(LogTo::Ephemeral, |_| LogTo::File),
             with_time: false,
@@ -87,7 +88,7 @@ impl Logger {
     }
 
     #[track_caller]
-    fn log<F, T>(&mut self, level: &'static str, f: F)
+    fn log<F, T>(&self, level: &'static str, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -110,7 +111,7 @@ impl Logger {
             log_to: self.log_to.clone(),
         };
 
-        match self.sx.send(entry) {
+        match self.sx.borrow_mut().send(entry) {
             Ok(_) => (),
             Err(_) => panic!("Logger thread died :("),
         }
@@ -124,7 +125,7 @@ impl Logger {
     /// Waits until all messages are logged
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        while self.sx.is_connected() {
+        while self.sx.borrow().is_connected() {
             thread::yield_now();
         }
 
@@ -134,7 +135,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn info<F, T>(&mut self, f: F)
+    pub fn info<F, T>(&self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -143,7 +144,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn error<F, T>(&mut self, f: F)
+    pub fn error<F, T>(&self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -152,7 +153,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn debug<F, T>(&mut self, f: F)
+    pub fn debug<F, T>(&self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -161,7 +162,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn warning<F, T>(&mut self, f: F)
+    pub fn warning<F, T>(&self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -199,11 +200,11 @@ mod tests {
 
     fn tt() {
         setup();
-        let mut logger = Logger::builder(None).with_time(true);
+        let logger = Logger::builder(None).with_time(true);
         logger.info(String::new);
         logger.info(|| String::from("hello"));
         logger.debug(|| "foo");
-        let mut logger = logger.with_time(false);
+        let logger = logger.with_time(false);
         logger.error(|| "bar");
         logger.warning(|| "world");
 
@@ -217,7 +218,7 @@ mod tests {
             path: "log.txt",
             append_mode: false,
         };
-        let mut logger = Logger::builder(Some(o)).with_time(false);
+        let logger = Logger::builder(Some(o)).with_time(false);
         logger.info(|| "to file".to_owned());
         logger.shutdown();
         let bytes = fs::read(o.path).unwrap();
@@ -226,7 +227,7 @@ mod tests {
 
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
-            "src/lib.rs:221 \u{1b}[32m[INFO]\u{1b}[0m to file\n".to_owned()
+            "src/lib.rs:222 \u{1b}[32m[INFO]\u{1b}[0m to file\n".to_owned()
         );
     }
 
@@ -236,7 +237,7 @@ mod tests {
             path: "log.txt",
             append_mode: false,
         };
-        let mut logger = Logger::builder(Some(o));
+        let logger = Logger::builder(Some(o));
         for i in 0..1000 {
             logger.debug(move || format!("{}", i));
         }
@@ -246,7 +247,7 @@ mod tests {
         for (i, line) in fs::read_to_string("log.txt").unwrap().lines().enumerate() {
             assert_eq!(
                 line,
-                format!("src/lib.rs:241 \u{1b}[36m[DEBUG]\u{1b}[0m {}", i)
+                format!("src/lib.rs:242 \u{1b}[36m[DEBUG]\u{1b}[0m {}", i)
             );
         }
         teardown();

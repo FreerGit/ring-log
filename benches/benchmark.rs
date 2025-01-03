@@ -23,7 +23,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         path: "log.txt",
         append_mode: false,
     };
-    let mut logger = Logger::builder(Some(o));
+    let logger = Logger::builder(Some(o));
     let mut group = c.benchmark_group("print");
     group.measurement_time(Duration::from_micros(25));
     group.sample_size(10);
