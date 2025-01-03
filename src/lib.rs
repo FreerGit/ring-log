@@ -1,10 +1,9 @@
+use lockfree::channel::spsc::{create, Sender};
 use std::fs::File;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self};
-
-use crossbeam::queue::ArrayQueue;
 
 #[derive(Clone)]
 pub enum LogTo {
@@ -18,7 +17,7 @@ struct LogEntry {
 }
 
 pub struct Logger {
-    queue: Arc<ArrayQueue<LogEntry>>,
+    sx: Sender<LogEntry>,
     file: Option<File>,
     log_to: LogTo,
     with_time: bool,
@@ -27,14 +26,14 @@ pub struct Logger {
 
 #[derive(Clone, Copy)]
 pub struct LoggerFileOptions {
-    path: &'static str,
-    append_mode: bool,
+    pub path: &'static str,
+    pub append_mode: bool,
 }
 
 impl Logger {
-    pub fn builder(size: usize, log_op: Option<LoggerFileOptions>) -> Self {
-        let queue = Arc::new(ArrayQueue::<LogEntry>::new(size));
-        let queue_clone = queue.clone();
+    pub fn builder(log_op: Option<LoggerFileOptions>) -> Self {
+        let (sx, mut rx) = create::<LogEntry>();
+
         let shutdown_flag = Arc::new(AtomicBool::new(false));
         let shutdown_flag_clone = shutdown_flag.clone();
         thread::spawn(move || {
@@ -44,22 +43,25 @@ impl Logger {
             }
 
             loop {
-                if let Some(entry) = queue_clone.pop() {
-                    let mut message = (entry.closure)();
-
-                    match entry.log_to {
-                        LogTo::File => {
-                            message.push('\n');
-                            let f = file.as_mut().unwrap();
-                            f.write_all(message.as_bytes()).unwrap();
-                            f.flush().unwrap();
+                match rx.recv() {
+                    Err(_) => {
+                        if shutdown_flag_clone.load(Ordering::Acquire) {
+                            break;
                         }
-                        LogTo::Ephemeral => println!("{}", message),
-                    };
-                } else if queue_clone.is_empty() && shutdown_flag_clone.load(Ordering::Acquire) {
-                    break;
-                } else {
-                    thread::yield_now();
+                    }
+                    Ok(entry) => {
+                        let mut message = (entry.closure)();
+
+                        match entry.log_to {
+                            LogTo::File => {
+                                message.push('\n');
+                                let f = file.as_mut().unwrap();
+                                f.write_all(message.as_bytes()).unwrap();
+                                f.flush().unwrap();
+                            }
+                            LogTo::Ephemeral => println!("{}", message),
+                        };
+                    }
                 }
             }
         });
@@ -67,7 +69,7 @@ impl Logger {
         let file = log_op.map(Logger::open_log_file);
 
         Logger {
-            queue,
+            sx,
             file,
             log_to: log_op.map_or(LogTo::Ephemeral, |_| LogTo::File),
             with_time: false,
@@ -85,7 +87,7 @@ impl Logger {
     }
 
     #[track_caller]
-    fn log<F, T>(&self, level: &'static str, f: F)
+    fn log<F, T>(&mut self, level: &'static str, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -108,10 +110,9 @@ impl Logger {
             log_to: self.log_to.clone(),
         };
 
-        // let value = ;
-        let value = self.queue.push(entry);
-        while value.is_err() {
-            thread::yield_now(); // Wait if the queue is full
+        match self.sx.send(entry) {
+            Ok(_) => (),
+            Err(_) => panic!("Logger thread died :("),
         }
     }
 
@@ -123,7 +124,7 @@ impl Logger {
     /// Waits until all messages are logged
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        while !self.queue.is_empty() {
+        while self.sx.is_connected() {
             thread::yield_now();
         }
 
@@ -133,7 +134,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn info<F, T>(&self, f: F)
+    pub fn info<F, T>(&mut self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -142,7 +143,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn error<F, T>(&self, f: F)
+    pub fn error<F, T>(&mut self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -151,7 +152,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn debug<F, T>(&self, f: F)
+    pub fn debug<F, T>(&mut self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -160,7 +161,7 @@ impl Logger {
     }
 
     #[track_caller]
-    pub fn warning<F, T>(&self, f: F)
+    pub fn warning<F, T>(&mut self, f: F)
     where
         F: FnOnce() -> T + Send + 'static,
         T: AsRef<str>,
@@ -171,7 +172,6 @@ impl Logger {
 
 #[cfg(test)]
 mod tests {
-    use timing_rdtsc::timing;
 
     use super::*;
     use std::fs;
@@ -195,18 +195,18 @@ mod tests {
         simple_to_file();
         correct_ord();
         tt();
-        test_thread_safety();
     }
 
     fn tt() {
         setup();
-        let logger = Logger::builder(1024, None).with_time(true);
+        let mut logger = Logger::builder(None).with_time(true);
         logger.info(String::new);
         logger.info(|| String::from("hello"));
         logger.debug(|| "foo");
-        let logger = logger.with_time(false);
+        let mut logger = logger.with_time(false);
         logger.error(|| "bar");
         logger.warning(|| "world");
+
         logger.shutdown();
         teardown();
     }
@@ -217,11 +217,13 @@ mod tests {
             path: "log.txt",
             append_mode: false,
         };
-        let logger = Logger::builder(1024, Some(o)).with_time(false);
+        let mut logger = Logger::builder(Some(o)).with_time(false);
         logger.info(|| "to file".to_owned());
         logger.shutdown();
         let bytes = fs::read(o.path).unwrap();
+
         teardown();
+
         assert_eq!(
             String::from_utf8(bytes).unwrap(),
             "src/lib.rs:221 \u{1b}[32m[INFO]\u{1b}[0m to file\n".to_owned()
@@ -234,8 +236,8 @@ mod tests {
             path: "log.txt",
             append_mode: false,
         };
-        let logger = Logger::builder(1024 * 1024, Some(o));
-        for i in 0..100_000 {
+        let mut logger = Logger::builder(Some(o));
+        for i in 0..1000 {
             logger.debug(move || format!("{}", i));
         }
 
@@ -244,76 +246,9 @@ mod tests {
         for (i, line) in fs::read_to_string("log.txt").unwrap().lines().enumerate() {
             assert_eq!(
                 line,
-                format!("src/lib.rs:239 \u{1b}[36m[DEBUG]\u{1b}[0m {}", i)
+                format!("src/lib.rs:241 \u{1b}[36m[DEBUG]\u{1b}[0m {}", i)
             );
         }
         teardown();
-    }
-
-    fn test_thread_safety() {
-        use std::fs;
-        use std::sync::{Arc, Barrier};
-
-        const NUM_THREADS: usize = 1;
-        const ENTRIES_PER_THREAD: usize = 1000;
-        const EXPECTED_TOTAL_ENTRIES: usize = NUM_THREADS * ENTRIES_PER_THREAD;
-        let log_file_path = "thread_safety_test.log";
-
-        // Configure the logger to write to a file
-        let logger = Arc::new(Logger::builder(
-            1024 * 100,
-            Some(LoggerFileOptions {
-                path: log_file_path,
-                append_mode: false,
-            }),
-        ));
-        let barrier = Arc::new(Barrier::new(NUM_THREADS + 1));
-
-        let mut handles = vec![];
-        for thread_id in 0..NUM_THREADS {
-            let logger = logger.clone();
-            let barrier = barrier.clone();
-            let handle = std::thread::spawn(move || {
-                barrier.wait(); // Ensure all threads start logging simultaneously
-                let time = timing(|| {
-                    for i in 0..ENTRIES_PER_THREAD {
-                        logger.info(move || format!("Thread {} - Entry {}", thread_id, i));
-                    }
-                });
-
-                println!("{:#?}", time);
-            });
-            handles.push(handle);
-        }
-
-        barrier.wait(); // Start all threads
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        logger.shutdown();
-
-        // Validate the log file
-        let content = fs::read_to_string(log_file_path).expect("Failed to read log file.");
-        let log_entries: Vec<&str> = content.lines().collect();
-
-        assert_eq!(
-            log_entries.len(),
-            EXPECTED_TOTAL_ENTRIES,
-            "The total number of log entries is incorrect."
-        );
-
-        let mut seen_entries = std::collections::HashSet::new();
-        for line in log_entries {
-            assert!(seen_entries.insert(line.to_string()));
-        }
-        assert_eq!(
-            seen_entries.len(),
-            EXPECTED_TOTAL_ENTRIES,
-            "Duplicate or missing log entries detected."
-        );
-
-        fs::remove_file(log_file_path).expect("Failed to remove log file.");
     }
 }

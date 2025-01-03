@@ -3,7 +3,7 @@
 [![license](https://img.shields.io/github/license/freergit/ring-log)](https://github.com/freergit/ring-log/blob/main/LICENSE.txt)
 
 # ring-log
-High-performance logger with lock-free ring buffer, use this library when you want to log in the hotpath and performance is critical.
+High-performance logger with lock-free ring buffer (SPSC), use this library when you want to log in the hotpath and performance is critical.
 
 ## Example
 Submitting a log to either stdout or a file is very simple, you just give a closure which evaluates to a string. This is extremely fast, usually less than 100 nanos. A simple example:
@@ -16,7 +16,7 @@ let o = LoggerFileOptions {
 
 // The size is bounded, issuing a new log when the ringbuffer is full will block.
 // When passing a LoggerFileOptions, .with_log_type(LogTo::File) is set implicitly.
-let logger = Logger::builder(1024 * 8, Some(o)).with_time(true);
+let logger = Logger::builder(Some(o)).with_time(true);
 
 // Log to file
 logger.info(String::new);
