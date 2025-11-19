@@ -1,4 +1,4 @@
-use lockfree::channel::spsc::{create, Sender};
+use lock_freedom::channel::spsc::{create, Sender};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::Write;

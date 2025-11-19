@@ -11,7 +11,7 @@ keywords = ["log", "logger", "logging", "ring-buffer", "multi-threading"]
 [dependencies]
 chrono = "0.4.39"
 crossbeam = "0.8.4"
-lockfree = "0.5.1"
+lock_freedom = "0.1.1"
 timing_rdtsc = "0.1.2"
 
 [dev-dependencies]
